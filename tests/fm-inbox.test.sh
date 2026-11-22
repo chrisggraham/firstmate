@@ -339,12 +339,6 @@ after_id=$(printf '%s' "$after" | python3 -c 'import json,sys; print(json.load(s
 assert_equals "$later" "$after_id" \
   "a same-second reply recorded after the cursor is still delivered"
 
-set +e
-conflict=$(run_inbox "$home" reply "$earlier" "answer one" 2>&1)
-conflict_code=$?
-set -e
-expect_code 1 "$conflict_code" "a second reply for the same note is refused"
-assert_contains "$conflict" "already recorded" "the refusal names the existing record"
 pass "the reply channel is durable and its cursor is a strict order"
 
 # A lost sequence counter must not move the cursor backwards: the next reply
@@ -377,6 +371,122 @@ assert_equals "0" "$(printf '%s' "$malformed" | json_len replies)" \
 assert_contains "$malformed" "malformed replies without a valid sequence: 1 ($bad)" \
   "receipts name the malformed reply"
 pass "a reply without a valid sequence is reported as malformed"
+
+# --- outbox posts, references, multiple replies, one message stream --------
+
+message_field() {  # <index> <key>
+  python3 -c 'import json,sys
+v=json.load(sys.stdin)["messages"][int(sys.argv[1])][sys.argv[2]]
+print("null" if v is None else v)' "$@"
+}
+
+message_column() {  # <key>  -> space-separated values in stream order
+  python3 -c 'import json,sys
+print(" ".join("null" if m[sys.argv[1]] is None else str(m[sys.argv[1]])
+               for m in json.load(sys.stdin)["messages"]))' "$1"
+}
+
+home=$(make_home stream)
+mkdir -p "$home/state/inbox"
+legacy_note="1600000000-legacy"
+printf 'id=%s\nat=2020-09-13T12:26:40Z\nsource=text\nannounce_marker=1\n--\nold history\n' \
+  "$legacy_note" > "$home/state/inbox/$legacy_note.note"
+
+posted=$(run_inbox "$home" post --json "Build finished on main") || fail "post should succeed"
+assert_equals "fm-inbox-post.v1" "$(printf '%s' "$posted" | json_get schema)" \
+  "post uses the post schema"
+post_id=$(printf '%s' "$posted" | json_get id)
+assert_contains "$post_id" "fm-" "a Firstmate message id starts with fm-"
+assert_equals "None" "$(printf '%s' "$posted" | json_get re)" \
+  "a post without --re references nothing"
+assert_present "$home/state/inbox/.outbox/$post_id" "the post is a durable record"
+pass "post stores a Firstmate message that needs no note"
+
+human_post=$(run_inbox "$home" post --re item:task-7 "Item seven is blocked") \
+  || fail "human post should succeed"
+assert_contains "$human_post" "posted fm-" "human post output names the message id"
+
+note_out=$(run_inbox "$home" note --json --re item:task-7 "What blocks item seven?") \
+  || fail "note --re should succeed"
+note_id=$(printf '%s' "$note_out" | json_get id)
+assert_equals "fm-inbox-note.v1" "$(printf '%s' "$note_out" | json_get schema)" \
+  "note --json keeps its schema"
+run_inbox "$home" reply "$note_id" "A failing test." >/dev/null || fail "first reply failed"
+second=$(run_inbox "$home" reply --json "$note_id" "Now fixed.") \
+  || fail "a second reply to the same note should be recorded"
+assert_equals "fm-inbox-reply.v1" "$(printf '%s' "$second" | json_get schema)" \
+  "the second reply keeps the reply schema"
+assert_equals "$note_id" "$(printf '%s' "$second" | json_get id)" \
+  "the reply result still names the note it answers"
+pass "a note takes more than one reply"
+
+stream=$(run_inbox "$home" messages) || fail "messages should succeed"
+assert_equals "fm-inbox-messages.v1" "$(printf '%s' "$stream" | json_get schema)" \
+  "messages use the messages schema"
+assert_equals "captain firstmate firstmate captain firstmate firstmate" \
+  "$(printf '%s' "$stream" | message_column from)" \
+  "the stream holds notes and Firstmate messages in recorded order"
+assert_equals "$legacy_note" "$(printf '%s' "$stream" | message_field 0 id)" \
+  "a note recorded before sequencing is listed first, as history"
+assert_equals "null null item:task-7 item:task-7 $note_id $note_id" \
+  "$(printf '%s' "$stream" | message_column re)" \
+  "references are kept, and every reply references its note"
+assert_equals "pending null null pending null null" \
+  "$(printf '%s' "$stream" | message_column state)" \
+  "only captain notes carry a state"
+assert_equals "Now fixed." "$(printf '%s' "$stream" | message_field 5 body)" \
+  "the stream carries the message body"
+cursors=$(printf '%s' "$stream" | message_column cursor)
+sorted=$(printf '%s' "$cursors" | tr ' ' '\n' | LC_ALL=C sort -u | tr '\n' ' ')
+assert_equals "$cursors " "$sorted" "stream cursors are unique and strictly increasing"
+pass "messages returns one ordered stream of every message"
+
+note_cursor=$(printf '%s' "$stream" | message_field 3 cursor)
+after=$(run_inbox "$home" messages --after "$note_cursor") \
+  || fail "messages --after should succeed"
+assert_equals "firstmate firstmate" "$(printf '%s' "$after" | message_column from)" \
+  "--after returns only messages recorded later"
+assert_equals "$(printf '%s' "$stream" | message_field 5 cursor)" \
+  "$(printf '%s' "$after" | json_get cursor)" \
+  "the stream cursor is the last message returned"
+run_inbox "$home" drain --ack "$note_id" >/dev/null || fail "drain --ack failed"
+acked=$(run_inbox "$home" messages) || fail "messages after ack should succeed"
+assert_equals "handled" "$(printf '%s' "$acked" | message_field 3 state)" \
+  "an acknowledged note reports handled"
+empty=$(run_inbox "$home" messages --after "$(printf '%s' "$after" | json_get cursor)") \
+  || fail "messages at the end of the stream should succeed"
+assert_equals "0" "$(printf '%s' "$empty" | json_len messages)" \
+  "nothing new after the last cursor"
+pass "the stream cursor pages forward and note state follows acknowledgement"
+
+receipts=$(run_inbox "$home" receipts --all-replies) || fail "receipts should succeed"
+receipt_shape=$(printf '%s' "$receipts" | python3 -c 'import json,sys
+r=json.load(sys.stdin)
+print(sorted(r), sorted(r["replies"][0]), sorted(r["handled"][0]))')
+assert_equals "['generated', 'handled', 'home', 'omitted', 'pending', 'replies', 'reply_cursor', 'schema'] ['at', 'body', 'cursor', 'id'] ['acknowledged', 'announced', 'at', 'body', 'id', 'reply', 'request_id', 'source']" \
+  "$receipt_shape" "receipts keep their v1 shape"
+assert_equals "A failing test." "$(printf '%s' "$receipts" | json_get replies 0 body)" \
+  "receipts keep showing the first reply to a note"
+pass "receipts output is unchanged by posts and further replies"
+
+set +e
+bad_ref=$(run_inbox "$home" post --re "has space" "x" 2>&1)
+bad_ref_code=$?
+set -e
+expect_code 1 "$bad_ref_code" "an invalid reference is refused"
+assert_contains "$bad_ref" "invalid reference" "the refusal names the reference"
+pass "a reference must be a plain id"
+
+# The new subcommands read and write only under FM_HOME, so a script from one
+# copy serves another home's records.
+home=$(make_home foreign)
+FM_HOME="$home" "$INBOX_BIN" post "from another copy" >/dev/null \
+  || fail "post with only FM_HOME set should succeed"
+foreign=$(FM_HOME="$home" "$INBOX_BIN" messages) \
+  || fail "messages with only FM_HOME set should succeed"
+assert_equals "from another copy" "$(printf '%s' "$foreign" | message_field 0 body)" \
+  "the message lands in the FM_HOME records"
+pass "post and messages use the records of the home FM_HOME names"
 
 # One undecodable note must not fail the whole receipts view.
 home=$(make_home non-utf8)

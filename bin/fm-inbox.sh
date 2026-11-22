@@ -20,10 +20,12 @@
 #           fleet work and must not become fleet work.
 #
 # Usage:
-#   fm-inbox.sh note [--request-id <id>] [--json] [--] <text>...
-#   fm-inbox.sh note [--request-id <id>] [--json] -   (body from stdin)
+#   fm-inbox.sh note [--request-id <id>] [--re <ref>] [--json] [--] <text>...
+#   fm-inbox.sh note [--request-id <id>] [--re <ref>] [--json] -   (body from stdin)
 #   fm-inbox.sh announce [--json] <id>
 #   fm-inbox.sh reply [--json] <id> <text>... | reply [--json] <id> -
+#   fm-inbox.sh post [--re <ref>] [--json] [--] <text>... | post [--re <ref>] [--json] -
+#   fm-inbox.sh messages [--after <cursor>]
 #   fm-inbox.sh receipts [--after <cursor>] [--all-pending] [--all-handled] [--all-replies]
 #   fm-inbox.sh ready
 #   fm-inbox.sh say  [<file.wav>]       (default: audio on stdin)
@@ -59,9 +61,29 @@
 # rather than implying the first page is everything; omitted[] names the
 # surface and how to reveal it, the same convention as fm-bearings-snapshot.sh.
 # `reply` is how the primary publishes its actual answer against a note id.
-# Each reply is stamped with a durable per-home sequence, so the receipts cursor
-# is a strict total order and two replies recorded in the same second are both
-# readable. One reply per note: a second one is refused.
+# A note takes any number of replies. The first keeps its historical record, so
+# receipts show it exactly as before; later replies appear only in `messages`.
+# `post` is a message Firstmate writes with no note to answer: a result, a
+# question, a notice. It wakes nothing.
+# Every note, reply and post is stamped with one durable per-home sequence, so
+# each cursor is a strict total order and two records written in the same
+# second are both readable. Receipts cursors come from that same sequence.
+# `--re <ref>` attaches an optional reference to a note or post: a Bearings item
+# (`item:<task-id>`) or another message id. A reply always references its note.
+# A reference is opaque here; nothing checks that it names an existing thing.
+# `messages` is the one ordered stream a chat client reads: notes and Firstmate
+# messages together, oldest first, after an optional cursor. JSON
+# `fm-inbox-messages.v1`:
+#   {"schema", "home", "generated", "messages": [...], "cursor", "omitted": [...]}
+#   message: {"id", "at", "from": "captain"|"firstmate", "body", "cursor",
+#             "re": <ref>|null, "state": "pending"|"handled"|null}
+# `state` is set only on captain notes. `cursor` is the last message returned,
+# or the --after value when none are; pass it back as --after to read on.
+# A page holds at most MESSAGES_BOUND messages and omitted[] says when more wait.
+# Firstmate message ids start with `fm-`. A note saved before this home kept the
+# sequence has no sequence of its own: it is listed first, as history, with a
+# cursor that sorts before every sequenced one. `post --json` prints
+# `fm-inbox-post.v1`: {"schema", "outcome", "id", "re", "cursor", "path"}.
 # `ready` is the read-only primary-readiness projection (lock, wake-consumer
 # health, away posture, observation time). It never acquires the session lock
 # and never infers liveness from a lock file, a session, or a pane.
@@ -81,18 +103,18 @@
 # An absent profile means the call uses whatever credentials are already in the
 # environment, which is also what FM_INBOX_PROFILE= (empty) forces.
 #
-# `note`, `announce`, `reply`, `receipts`, `ready`, `status`, `list` and `drain`
-# need NO configuration at all, because they make no model call. The voice
-# handover depends on `note`, so it keeps working in a home that has configured
-# nothing. `--json` / `receipts` / `ready` require python3, which a firstmate
-# home already uses for other tools.
+# `note`, `announce`, `reply`, `post`, `messages`, `receipts`, `ready`, `status`,
+# `list` and `drain` need NO configuration at all, because they make no model
+# call. The voice handover depends on `note`, so it keeps working in a home that
+# has configured nothing. `--json` / `messages` / `receipts` / `ready` require
+# python3, which a firstmate home already uses for other tools.
 #
 # Environment:
 #   FM_HOME              operational home whose state/ and data/ are used.
 #
 # PRIVACY: `say` sends your audio and `ask` sends your question to Bedrock.
-# `note`, `announce`, `reply`, `receipts`, `ready`, `status`, `list` and `drain`
-# make no network call at all.
+# `note`, `announce`, `reply`, `post`, `messages`, `receipts`, `ready`, `status`,
+# `list` and `drain` make no network call at all.
 #
 # `note` is also the queueing half of the spoken interface: when the voice agent
 # in bin/fm-voice-relay.py hands real work over to firstmate, it runs this
@@ -157,9 +179,8 @@ ASK_MODEL="${FM_INBOX_ASK_MODEL:-}"
 # Unset falls through to config; explicitly empty means "use ambient credentials".
 PROFILE="${FM_INBOX_PROFILE-$(read_setting inbox-profile)}"
 
-# Resolved only by the subcommands that make a model call, so note, announce,
-# reply, receipts, ready, status, list and drain keep working in a home that
-# has configured nothing.
+# Resolved only by the subcommands that make a model call, so every other
+# subcommand keeps working in a home that has configured nothing.
 need_region() {
   [ -n "$REGION" ] || REGION=$(require_setting inbox-region FM_INBOX_REGION "AWS region")
 }
@@ -196,12 +217,16 @@ aws_call() {
 REQUESTS="$INBOX/.requests"
 ANNOUNCED_DIR="$INBOX/.announced"
 REPLIES="$INBOX/.replies"
+OUTBOX="$INBOX/.outbox"
 
-REPLY_SEQ_LOCK="$INBOX/.replies.lock"
+# One sequence for notes, replies and posts. The lock and counter keep their
+# reply-era paths so the cursor continues across an upgrade.
+MESSAGE_SEQ_LOCK="$INBOX/.replies.lock"
 
 RECEIPTS_PENDING_BOUND=20
 RECEIPTS_HANDLED_BOUND=20
 RECEIPTS_REPLIES_BOUND=20
+MESSAGES_BOUND=100
 
 load_wake_lib() {
   local lib="$FM_ROOT/bin/fm-wake-lib.sh"
@@ -225,6 +250,11 @@ valid_request_id() {
     *[!A-Za-z0-9._:-]*) return 1 ;;
   esac
   return 0
+}
+
+# A --re reference is opaque, so it follows the request-id character rules.
+valid_reference() {
+  valid_request_id "$1"
 }
 
 valid_note_id() {
@@ -300,6 +330,18 @@ write_note_file() {  # <path> <id> <source> <body> [extra] [request-id]
       *) printf '\n' ;;
     esac
   } >"$path"
+}
+
+# Move a staged note into place stamped with the message sequence. A note must
+# never be lost, so when the sequence cannot be claimed it is saved without one
+# and the message stream lists it as history.
+save_note() {  # <staged> <id>
+  local staged=$1 dest="$INBOX/$2.note" saved=0
+  if load_wake_lib && fm_lock_acquire_wait "$MESSAGE_SEQ_LOCK"; then
+    publish_sequenced "$staged" "$dest" >/dev/null && saved=1
+    fm_lock_release "$MESSAGE_SEQ_LOCK"
+  fi
+  [ "$saved" -eq 1 ] || mv "$staged" "$dest"
 }
 
 emit_note_json() {  # <outcome> <id> <request-id> <saved> <announced> <path> [acknowledged]
@@ -417,7 +459,7 @@ publish_from_reservation() {  # <request-id> <source> <body> <extra>
   if [ ! -f "$INBOX/$id.note" ] && [ ! -f "$INBOX/handled/$id.note" ]; then
     tmp=$(mktemp "$INBOX/.staging-XXXXXX")
     write_note_file "$tmp" "$id" "$source" "$body" "$extra" "$request_id"
-    mv "$tmp" "$INBOX/$id.note"
+    save_note "$tmp" "$id"
   fi
   printf '%s\n' "$id"
 }
@@ -454,7 +496,7 @@ queue_note() {
       finish_note_result replay "$id" "$request_id" "$json" "$strict" "$summary"
       return $?
     fi
-    mv "$tmp" "$INBOX/$id.note"
+    save_note "$tmp" "$id"
     summary=$(note_summary_from_body "$body")
     finish_note_result created "$id" "$request_id" "$json" "$strict" "$summary"
     return $?
@@ -464,38 +506,46 @@ queue_note() {
   staging_name=$(basename "$tmp")
   id="$(date +%s)-${staging_name#.staging-}"
   write_note_file "$tmp" "$id" "$source" "$body" "$extra" ""
-  mv "$tmp" "$INBOX/$id.note"
+  save_note "$tmp" "$id"
   summary=$(note_summary_from_body "$body")
   finish_note_result created "$id" "" "$json" "$strict" "$summary"
 }
 
+NOTE_USAGE="usage: fm-inbox.sh note [--request-id <id>] [--re <ref>] [--json] [--] <text>... (or: note -)"
+
 cmd_note() {
-  local body json=0 request_id=""
+  local body json=0 request_id="" re=""
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --json) json=1; shift ;;
       --request-id)
-        [ "$#" -ge 2 ] || die "usage: fm-inbox.sh note [--request-id <id>] [--json] [--] <text>... (or: note -)"
+        [ "$#" -ge 2 ] || die "$NOTE_USAGE"
         request_id=$2
         valid_request_id "$request_id" \
           || die "invalid request id (use 1-128 characters: A-Za-z0-9._:-)"
         shift 2
         ;;
+      --re)
+        [ "$#" -ge 2 ] || die "$NOTE_USAGE"
+        re=$2
+        valid_reference "$re" || die "invalid reference (use 1-128 characters: A-Za-z0-9._:-)"
+        shift 2
+        ;;
       --) shift; break ;;
-      -h|--help) die "usage: fm-inbox.sh note [--request-id <id>] [--json] [--] <text>... (or: note -)" ;;
+      -h|--help) die "$NOTE_USAGE" ;;
       *) break ;;
     esac
   done
   if [ "$#" -eq 0 ]; then
-    die "usage: fm-inbox.sh note [--request-id <id>] [--json] [--] <text>... (or: note -)"
+    die "$NOTE_USAGE"
   elif [ "$1" = "-" ]; then
-    [ "$#" -eq 1 ] || die "usage: fm-inbox.sh note [--request-id <id>] [--json] -"
+    [ "$#" -eq 1 ] || die "$NOTE_USAGE"
     body=$(cat; printf .)
     body=${body%.}
   else
     body="$*"
   fi
-  queue_note text "$body" "" "$request_id" "$json"
+  queue_note text "$body" "${re:+re=$re}" "$request_id" "$json"
 }
 
 cmd_announce() {
@@ -558,18 +608,26 @@ cmd_announce() {
   die "note $id is saved at $path but firstmate was NOT woken"
 }
 
-# Claim the next reply sequence. The caller holds REPLY_SEQ_LOCK across the
-# claim AND the record write, so a reply a reader can see implies every lower
+# Claim the next message sequence. The caller holds MESSAGE_SEQ_LOCK across the
+# claim AND the record write, so a record a reader can see implies every lower
 # sequence is already readable: the cursor stays a strict total order.
-# The claim is above both the counter and every recorded reply, and the counter
-# is replaced by rename, so a torn or lost counter can never move it backwards.
-next_reply_seq() {
-  local seq_file="$REPLIES/.seq" seq recorded tmp
+# The claim is above both the counter and every recorded note, reply and post,
+# and the counter is replaced by rename, so a torn or lost counter can never
+# move it backwards.
+next_message_seq() {
+  local seq_file="$REPLIES/.seq" seq recorded tmp dir
+  local dirs=()
+  mkdir -p "$REPLIES"
+  for dir in "$REPLIES" "$OUTBOX" "$INBOX" "$INBOX/handled"; do
+    if [ -d "$dir" ]; then
+      dirs+=("$dir")
+    fi
+  done
   seq=$(cat "$seq_file" 2>/dev/null || printf '0')
   case "$seq" in
     ''|*[!0-9]*) seq=0 ;;
   esac
-  recorded=$(find "$REPLIES" -maxdepth 1 -type f ! -name '.*' -exec awk '
+  recorded=$(find "${dirs[@]}" -maxdepth 1 -type f ! -name '.*' -exec awk '
     FNR == 1 { head = 1 }
     /^--$/ { head = 0 }
     head && /^seq=[0-9]+$/ { v = substr($0, 5) + 0; if (v > max) max = v }
@@ -587,8 +645,61 @@ next_reply_seq() {
   printf '%s\n' "$seq"
 }
 
+# Stamp a staged record with the next message sequence and move it into place.
+# The caller holds MESSAGE_SEQ_LOCK. Prints the sequence.
+publish_sequenced() {  # <staged> <dest>
+  local staged=$1 dest=$2 seq stamped
+  seq=$(next_message_seq) || return 1
+  stamped=$(mktemp "${dest%/*}/.staging-XXXXXX") || return 1
+  if ! { printf 'seq=%s\n' "$seq"; cat "$staged"; } >"$stamped" || ! mv "$stamped" "$dest"; then
+    rm -f "$stamped"
+    return 1
+  fi
+  rm -f "$staged"
+  printf '%s\n' "$seq"
+}
+
+# A Firstmate message record: headers, a `--` line, then the body.
+write_message_file() {  # <path> <id> <body> [extra-headers]
+  local path=$1 id=$2 body=$3 extra=${4:-}
+  {
+    printf 'id=%s\n' "$id"
+    printf 'at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    [ -z "$extra" ] || printf '%s\n' "$extra"
+    printf -- '--\n'
+    printf '%s' "$body"
+    case "$body" in
+      *$'\n') ;;
+      *) printf '\n' ;;
+    esac
+  } >"$path"
+}
+
+# Stage a Firstmate message in the outbox. Sets STAGED and MESSAGE_ID.
+stage_outbox_message() {  # <body> [extra-headers]
+  mkdir -p "$OUTBOX"
+  STAGED=$(mktemp "$OUTBOX/.staging-XXXXXX")
+  MESSAGE_ID="fm-$(date +%s)-${STAGED##*/.staging-}"
+  write_message_file "$STAGED" "$MESSAGE_ID" "$1" "${2:-}"
+}
+
+# Stage a reply to <note-id>; the caller holds MESSAGE_SEQ_LOCK, so two replies
+# cannot both claim the first-reply record. The first reply keeps its historical
+# record under .replies/<note-id>, so receipts show it as before. A later reply
+# is an outbox message that references the note. Sets STAGED and DEST.
+stage_reply() {  # <note-id> <body>
+  if [ -f "$REPLIES/$1" ]; then
+    stage_outbox_message "$2" "re=$1"
+    DEST="$OUTBOX/$MESSAGE_ID"
+    return 0
+  fi
+  STAGED=$(mktemp "$REPLIES/.staging-XXXXXX")
+  write_message_file "$STAGED" "$1" "$2"
+  DEST="$REPLIES/$1"
+}
+
 cmd_reply() {
-  local json=0 id body path staging seq
+  local json=0 id body path
   if [ "${1:-}" = "--json" ]; then
     json=1
     shift
@@ -610,32 +721,17 @@ cmd_reply() {
   [ -n "${body//[[:space:]]/}" ] || die "refusing to record an empty reply"
   mkdir -p "$REPLIES"
   load_wake_lib || die "the reply sequence needs $FM_ROOT/bin/fm-wake-lib.sh"
-  fm_lock_acquire_wait "$REPLY_SEQ_LOCK" || die "could not claim the reply sequence"
-  if [ -f "$REPLIES/$id" ]; then
-    fm_lock_release "$REPLY_SEQ_LOCK"
-    die "reply already recorded for $id"
-  fi
-  if ! seq=$(next_reply_seq); then
-    fm_lock_release "$REPLY_SEQ_LOCK"
+  fm_lock_acquire_wait "$MESSAGE_SEQ_LOCK" || die "could not claim the reply sequence"
+  stage_reply "$id" "$body"
+  if ! publish_sequenced "$STAGED" "$DEST" >/dev/null; then
+    rm -f "$STAGED"
+    fm_lock_release "$MESSAGE_SEQ_LOCK"
     die "could not claim the reply sequence"
   fi
-  staging=$(mktemp "$REPLIES/.staging-XXXXXX")
-  {
-    printf 'id=%s\n' "$id"
-    printf 'at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    printf 'seq=%s\n' "$seq"
-    printf -- '--\n'
-    printf '%s' "$body"
-    case "$body" in
-      *$'\n') ;;
-      *) printf '\n' ;;
-    esac
-  } >"$staging"
-  mv "$staging" "$REPLIES/$id"
-  fm_lock_release "$REPLY_SEQ_LOCK"
+  fm_lock_release "$MESSAGE_SEQ_LOCK"
   if [ "$json" -eq 1 ]; then
     need_python
-    python3 - "$id" "$REPLIES/$id" <<'PY'
+    python3 - "$id" "$DEST" <<'PY'
 import json, sys
 note_id, path = sys.argv[1], sys.argv[2]
 json.dump({
@@ -649,6 +745,211 @@ PY
   else
     printf 'replied %s\n' "$id"
   fi
+}
+
+POST_USAGE="usage: fm-inbox.sh post [--re <ref>] [--json] [--] <text>... (or: post [--re <ref>] [--json] -)"
+
+cmd_post() {
+  local json=0 re="" body seq
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --json) json=1; shift ;;
+      --re)
+        [ "$#" -ge 2 ] || die "$POST_USAGE"
+        re=$2
+        valid_reference "$re" || die "invalid reference (use 1-128 characters: A-Za-z0-9._:-)"
+        shift 2
+        ;;
+      --) shift; break ;;
+      -h|--help) die "$POST_USAGE" ;;
+      *) break ;;
+    esac
+  done
+  if [ "$#" -eq 0 ]; then
+    die "$POST_USAGE"
+  elif [ "$1" = "-" ]; then
+    [ "$#" -eq 1 ] || die "$POST_USAGE"
+    body=$(cat; printf .)
+    body=${body%.}
+  else
+    body="$*"
+  fi
+  [ -n "${body//[[:space:]]/}" ] || die "refusing to post an empty message"
+  [ "$json" -eq 0 ] || need_python
+  load_wake_lib || die "the message sequence needs $FM_ROOT/bin/fm-wake-lib.sh"
+  stage_outbox_message "$body" "${re:+re=$re}"
+  seq=$(publish_outbox_message) || die "could not claim the message sequence"
+  emit_post_result "$MESSAGE_ID" "$re" "$seq" "$json"
+}
+
+# Publish the staged outbox message under the sequence lock. Prints the sequence.
+publish_outbox_message() {
+  local seq
+  fm_lock_acquire_wait "$MESSAGE_SEQ_LOCK" || return 1
+  if ! seq=$(publish_sequenced "$STAGED" "$OUTBOX/$MESSAGE_ID"); then
+    rm -f "$STAGED"
+    fm_lock_release "$MESSAGE_SEQ_LOCK"
+    return 1
+  fi
+  fm_lock_release "$MESSAGE_SEQ_LOCK"
+  printf '%s\n' "$seq"
+}
+
+emit_post_result() {  # <id> <re> <seq> <json>
+  if [ "$4" -eq 0 ]; then
+    printf 'posted %s\n' "$1"
+    return 0
+  fi
+  python3 - "$1" "$2" "$3" "$OUTBOX/$1" <<'PY'
+import json, sys
+message_id, re, seq, path = sys.argv[1:5]
+json.dump({
+    "schema": "fm-inbox-post.v1",
+    "outcome": "created",
+    "id": message_id,
+    "re": re or None,
+    "cursor": "%012d" % int(seq),
+    "path": path,
+}, sys.stdout, separators=(",", ":"))
+sys.stdout.write("\n")
+PY
+}
+
+MESSAGES_USAGE="usage: fm-inbox.sh messages [--after <cursor>]"
+
+cmd_messages() {
+  local after=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --after)
+        [ "$#" -ge 2 ] || die "$MESSAGES_USAGE"
+        after=$2
+        shift 2
+        ;;
+      # The output is always JSON; the flag is accepted for symmetry with note and post.
+      --json) shift ;;
+      *) die "$MESSAGES_USAGE" ;;
+    esac
+  done
+  need_python
+  python3 - "$INBOX" "$FM_HOME" "$after" "$MESSAGES_BOUND" \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" <<'PY'
+import json, sys
+from pathlib import Path
+
+inbox, home, after, bound, generated = sys.argv[1:6]
+inbox = Path(inbox)
+bound = int(bound)
+
+# Same record format and tolerance as receipts: a record that vanishes between
+# listing and reading is skipped, and undecodable bytes are replaced.
+def parse_record(path):
+    try:
+        text = Path(path).read_bytes().decode("utf-8", errors="replace")
+    except FileNotFoundError:
+        return None
+    headers, sep, body = text.partition("\n--\n")
+    if not sep:
+        headers, sep, body = text.partition("\n--")
+        if sep:
+            body = body[1:] if body.startswith("\n") else body
+        else:
+            body = ""
+    meta = {}
+    for line in headers.splitlines():
+        if "=" in line:
+            key, val = line.split("=", 1)
+            meta[key] = val
+    if body.endswith("\n"):
+        body = body[:-1]
+    return meta, body
+
+def records(folder, pattern):
+    if not folder.is_dir():
+        return
+    for path in sorted(folder.glob(pattern)):
+        if path.name.startswith("."):
+            continue
+        record = parse_record(path)
+        if record is not None:
+            yield path, record[0], record[1]
+
+def sequence_cursor(meta):
+    raw = meta.get("seq") or ""
+    if raw.isascii() and raw.isdigit():
+        return "%012d" % int(raw)
+    return None
+
+def message(message_id, meta, body, sender, cursor, re, state):
+    return {
+        "id": message_id,
+        "at": meta.get("at"),
+        "from": sender,
+        "body": body,
+        "cursor": cursor,
+        "re": re or None,
+        "state": state,
+    }
+
+# Pending is read before handled, so a note acknowledged mid-listing is still
+# found, and a note seen in both is reported once, as handled.
+# A note saved without a sequence predates it, so its cursor sorts before every
+# sequenced one and the note is listed first, as history.
+notes = {}
+for folder, state in ((inbox, "pending"), (inbox / "handled", "handled")):
+    for path, meta, body in records(folder, "*.note"):
+        note_id = meta.get("id") or path.name[:-5]
+        cursor = sequence_cursor(meta) or "%012d-%s" % (0, note_id)
+        notes[note_id] = message(note_id, meta, body, "captain", cursor, meta.get("re"), state)
+
+# The first reply to a note keeps its historical record, named by the note id;
+# every other Firstmate message is an outbox record.
+def firstmate_records():
+    for path, meta, body in records(inbox / ".replies", "*"):
+        yield "fm-reply-" + path.name, path.name, meta, body
+    for path, meta, body in records(inbox / ".outbox", "*"):
+        yield meta.get("id") or path.name, meta.get("re"), meta, body
+
+# A Firstmate message is always written with a sequence, so one without a valid
+# sequence is malformed: it is reported in omitted[], not given a made-up place.
+firstmate = []
+malformed = []
+for message_id, re, meta, body in firstmate_records():
+    cursor = sequence_cursor(meta)
+    if cursor is None:
+        malformed.append(message_id)
+        continue
+    firstmate.append(message(message_id, meta, body, "firstmate", cursor, re, None))
+
+stream = sorted(list(notes.values()) + firstmate, key=lambda m: m["cursor"])
+if after:
+    stream = [m for m in stream if m["cursor"] > after]
+
+omitted = []
+if len(stream) > bound:
+    omitted.append({
+        "surface": "messages omitted by bound: %d" % (len(stream) - bound),
+        "reveal": "pass --after <cursor> to read the next page",
+    })
+    stream = stream[:bound]
+if malformed:
+    omitted.append({
+        "surface": "malformed messages without a valid sequence: %d (%s)"
+            % (len(malformed), ", ".join(sorted(malformed))),
+        "reveal": "inspect %s" % inbox,
+    })
+
+home_label = "/".join(Path(home).parts[-2:]) if home else home
+json.dump({
+    "schema": "fm-inbox-messages.v1",
+    "home": home_label,
+    "generated": generated,
+    "messages": stream,
+    "cursor": stream[-1]["cursor"] if stream else after,
+    "omitted": omitted,
+}, sys.stdout, separators=(",", ":"))
+sys.stdout.write("\n")
+PY
 }
 
 cmd_receipts() {
@@ -1139,6 +1440,8 @@ case "${1:-}" in
   note)     shift; cmd_note "$@" ;;
   announce) shift; cmd_announce "$@" ;;
   reply)    shift; cmd_reply "$@" ;;
+  post)     shift; cmd_post "$@" ;;
+  messages) shift; cmd_messages "$@" ;;
   receipts) shift; cmd_receipts "$@" ;;
   ready)    shift; cmd_ready "$@" ;;
   say)      shift; cmd_say "$@" ;;
