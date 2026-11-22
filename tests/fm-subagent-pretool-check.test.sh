@@ -134,6 +134,40 @@ test_plan_only_exclusion_is_exact_name() {
   pass "the plan-only exclusion releases exactly two names and nothing that merely contains them"
 }
 
+test_session_messaging_opt_in_is_narrow() {
+  local config="$PRIMARY/config" optin tool
+  optin="$config/allow-session-messaging"
+  mkdir -p "$config"
+  rm -rf "$optin"
+  for tool in ListAgents SendMessage; do
+    expect_deny "session messaging without opt-in" "$tool"
+  done
+  : > "$optin"
+  for tool in ListAgents SendMessage; do
+    expect_allow "session messaging with opt-in" "$tool"
+  done
+  # The opt-in releases exactly two names, never a substring or another stem.
+  for tool in Agent Task Workflow CronCreate RemoteTrigger Monitor ScheduleWakeup \
+              EnterWorktree ListAgentsNow SendMessageAll SubagentCreate; do
+    expect_deny "other delegation tool with opt-in" "$tool"
+  done
+  # A file with content, a directory, or an unreadable file keeps denying.
+  printf 'yes\n' > "$optin"
+  expect_deny "opt-in file with content" ListAgents
+  rm -f "$optin"
+  mkdir "$optin"
+  expect_deny "opt-in directory" ListAgents
+  rmdir "$optin"
+  : > "$optin"
+  chmod 000 "$optin"
+  if [ ! -r "$optin" ]; then
+    expect_deny "unreadable opt-in file" SendMessage
+  fi
+  chmod 600 "$optin"
+  rm -f "$optin"
+  pass "the session-messaging opt-in releases exactly ListAgents and SendMessage"
+}
+
 test_guard_never_classifies_mcp_tools() {
   # An MCP server names its own tools; a task or agent noun there is common and
   # has nothing to do with fleet dispatch.
@@ -281,6 +315,7 @@ test_guard_denies_hypothetical_future_tools
 test_guard_allows_ordinary_and_observe_only_tools
 test_guard_allows_session_local_todo_tools
 test_plan_only_exclusion_is_exact_name
+test_session_messaging_opt_in_is_narrow
 test_guard_never_classifies_mcp_tools
 test_deny_message_defers_to_intake_classification
 test_escape_hatch_allows_deliberate_use
