@@ -2860,6 +2860,30 @@ EOF
   pass "mixed secondmate roles, partial state, and captain readiness project independently"
 }
 
+test_decision_gate_and_landed_rows_carry_repo() {
+  local home fakebin json
+  home=$(make_home row-repo)
+  : > "$home/data/secondmates.md"
+  cat > "$home/data/backlog.md" <<'EOF'
+## In flight
+
+## Queued
+- [ ] pick-route - Pick the route (repo: phone-repo) (kind: captain) (hold: captain route choice) (hold-kind: captain)
+- [ ] later-work - Later work (repo: phone-repo) (kind: ship)
+
+## Done
+- [x] shipped - Shipped thing https://github.com/example/phone-repo/pull/3 (repo: phone-repo) (kind: ship) (merged 2026-07-10)
+EOF
+  fakebin=$(make_fakebin "$home")
+  json=$(run "$home" "$fakebin" --json)
+  printf '%s' "$json" | jq -e '
+    (.decisions_open | any(.id == "pick-route" and .repo == "phone-repo"))
+      and (.gates | any(.id == "later-work" and .repo == "phone-repo"))
+      and (.landed | any(.id == "shipped" and .repo == "phone-repo"))
+  ' >/dev/null || fail "decisions_open, gates and landed rows did not carry repo: $json"
+  pass "decisions_open, gates and landed rows carry repo"
+}
+
 test_main_captain_readiness_matches_secondmate_projection() {
   local home fakebin json
   home=$(make_home main-captain-readiness)
@@ -3498,6 +3522,7 @@ fm_test_run \
   test_newest_filed_gates_are_selected_before_snapshot_bounds \
   test_underway_and_gate_rows_carry_the_durable_name_and_filed_date \
   test_mixed_secondmate_roles_partial_state_and_captain_readiness \
+  test_decision_gate_and_landed_rows_carry_repo \
   test_main_captain_readiness_matches_secondmate_projection \
   test_completed_scout_report_not_pending \
   test_open_decision_surfaces_end_to_end \

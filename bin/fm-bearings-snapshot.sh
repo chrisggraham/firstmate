@@ -150,8 +150,8 @@ remote homes under one shared snapshot budget and may refresh the parent-side ca
 Default fields: schema, home, generated, prs, in_flight{id,kind,state,repo,name,doing},
   secondmates{id,state,doing,provenance,freshness,age_seconds,contradiction,reason},
   secondmate_reconcile{id,spawn_gen,host,kind,ids},
-  decisions_open{id,key,verb,summary,question,owner}, landed{id,what,artifact,owner},
-  gates{id,title,blocked_by,reason,owner,filed}, reports{id,path}, recorded_prs{id,url},
+  decisions_open{id,key,verb,summary,question,owner,repo},
+  landed{id,what,artifact,owner,repo}, gates{id,title,blocked_by,reason,owner,filed,repo}, reports{id,path}, recorded_prs{id,url},
   unhealthy_endpoints{...} (only when non-empty), omitted{surface,reveal}.
 Default gates are selected newest filed first before their bound; undated gates
   retain input order after dated gates.
@@ -435,7 +435,7 @@ MODEL=$(printf '%s' "$SNAP" | jq \
     {id, title:(.title | trunc(60)),
      blocked_by:((.unresolved_blocker_ids // []) | if length > 0 then join(",") else "-" end | trunc(120)),
      reason:(hold_gate_reason | trunc(40)), owner:$owner,
-     filed:((.since // null) | trunc(40))};
+     filed:((.since // null) | trunc(40)), repo:(.repo // null)};
   def round_robin_landed($n):
     . as $groups
     | [range(0; (($groups | map(length) | max) // 0)) as $i
@@ -448,7 +448,7 @@ MODEL=$(printf '%s' "$SNAP" | jq \
   | (($fl | index("actions")) != null) as $f_actions
   | (($fl | index("endpoints")) != null) as $f_endpoints
   | ([ .backlog.records[] | select(landed_record)
-       | {id, title, kind, hold_kind, pr_url, report_path, local_note, completion,
+       | {id, title, kind, hold_kind, pr_url, report_path, local_note, completion, repo,
           home:"(main)", home_id:"(main)"} ]) as $main_done
   | ((.secondmate_landed.records) // []) as $mate_done
   | ($main_done + $mate_done) as $all_landed_rows
@@ -532,7 +532,7 @@ MODEL=$(printf '%s' "$SNAP" | jq \
          | select(($all_decisions == 1) or live_captain_call)
          | {id,key:.id,verb:"captain-hold",
             summary:hold_summary(.title; .hold_reason),
-            question:(.title + ": " + .hold_reason),owner:"(main)"} ]
+            question:(.title + ": " + .hold_reason),owner:"(main)",repo:(.repo // null)} ]
      + [ (.secondmate_current.records // [])[] as $m
          | ([ $m.decisions_open[]?
               | select(.source == "backlog" and .verb == "captain-hold")
@@ -540,7 +540,7 @@ MODEL=$(printf '%s' "$SNAP" | jq \
               | {id:($m.id + "/" + .id),key,verb,
                  summary:hold_summary((.summary // .id);
                                       (.reason // "captain decision pending")),
-                 question:(.question // ((.summary // .id) + ": " + (.reason // "captain decision pending"))),owner:$m.id} ]
+                 question:(.question // ((.summary // .id) + ": " + (.reason // "captain decision pending"))),owner:$m.id,repo:(.repo // null)} ]
             + [ $m.queued[]?
                 | select($all_decisions == 1 and .hold_kind == "captain")
                 | select(.id as $id
@@ -551,7 +551,7 @@ MODEL=$(printf '%s' "$SNAP" | jq \
                 | {id:($m.id + "/" + .id),key:.id,verb:"captain-hold",
                    summary:hold_summary((.title // .id);
                                         (.hold_reason // "captain decision pending")),
-                   question:(.question // ((.title // .id) + ": " + (.hold_reason // "captain decision pending"))),owner:$m.id} ])[] ]) as $decisions_all
+                   question:(.question // ((.title // .id) + ": " + (.hold_reason // "captain decision pending"))),owner:$m.id,repo:(.repo // null)} ])[] ]) as $decisions_all
   | ([ .backlog.records[]
          | . as $record
          | select(.structured and projected_deferred_hold) ]
@@ -569,7 +569,8 @@ MODEL=$(printf '%s' "$SNAP" | jq \
          blocked_by:"-",
          reason:"away-return catch-up",
          owner:"(main)",
-         filed:null}]
+         filed:null,
+         repo:null}]
      else [] end) as $return_catchup_gate
   | ((if (.main_inventory.valid == false) then
         [{id:"(main-inventory)",
@@ -577,7 +578,8 @@ MODEL=$(printf '%s' "$SNAP" | jq \
           blocked_by:"-",
           reason:"main inventory",
           owner:"(main)",
-          filed:null}]
+          filed:null,
+          repo:null}]
       else [] end)
      + [ .backlog.records[]
          | . as $record
@@ -649,7 +651,7 @@ MODEL=$(printf '%s' "$SNAP" | jq \
         | {id, spawn_gen:(.spawn_gen // null), host:(.host // null), kind:(.reconcile_inventory.kind // null), ids:((.reconcile_inventory.ids // []) | map(select(type == "string")) | sort)} ],
       decisions_open: (if $all_decisions == 1 then $decisions_all else $decisions_all[:$decisions_n] end),
       landed: ($done | map({id, what:(.title | trunc(70)),
-                            artifact:(landed_artifact // "-"),owner:.home_id})),
+                            artifact:(landed_artifact // "-"),owner:.home_id,repo:(.repo // null)})),
       gates: ($return_catchup_gate
               + ($gates_all | newest_filed_first
                  | if $all_queued == 1 then . else .[:$gates_n] end)),

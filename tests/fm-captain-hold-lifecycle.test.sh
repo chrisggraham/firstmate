@@ -5116,6 +5116,40 @@ EOF
   pass "an answered captain call archived to a user-configured location still satisfies the completion gate"
 }
 
+
+inbox_in() {  # <home> <fm-inbox args...>
+  local home=$1
+  shift
+  FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" "$ROOT/bin/fm-inbox.sh" "$@"
+}
+
+# A new hold posts its reason once as a decision message about the item, and a
+# post that cannot be written never fails the hold.
+test_new_hold_posts_one_decision_message() {
+  local home stream err
+  home=$(make_home hold-posts-decision)
+  run_captain "$home" hold login-fix --title "Merge the login page fix" \
+    --reason "Merge the login page fix?" >/dev/null || fail "the hold failed"
+  run_captain "$home" hold login-fix --reason "Merge the login page fix?" >/dev/null \
+    || fail "repeating the active hold failed"
+  stream=$(inbox_in "$home" messages) || fail "messages failed"
+  assert_equals "1" "$(printf '%s' "$stream" | jq '.messages | length')" \
+    "a repeated active hold posts no second message"
+  assert_equals "decision|item:login-fix|Merge the login page fix?" \
+    "$(printf '%s' "$stream" | jq -r '.messages[0] | "\(.kind)|\(.re)|\(.body)"')" \
+    "the hold posts its reason as a decision about the item"
+
+  # A plain file where the outbox folder belongs makes every post fail.
+  rm -rf "$home/state/inbox/.outbox"
+  : > "$home/state/inbox/.outbox"
+  err=$(run_captain "$home" hold pick-date --title "Pick the release date" \
+    --reason "Which date?" 2>&1 >/dev/null) || fail "a failed post must not fail the hold"
+  assert_contains "$err" "decision message was not posted" "the failed post warns"
+  assert_contains "$(tasks_in "$home" show pick-date)" "hold_kind: captain" \
+    "the hold is in place although its post failed"
+  pass "a new hold posts one decision message and survives a failed post"
+}
+
 test_hold_reason_round_trips_awkward_characters
 test_hold_origins_follow_backend_holds
 test_interrupted_origin_move_does_not_inherit_the_previous_answer
@@ -5184,3 +5218,4 @@ test_captain_hold_mutations_address_the_beads_backend
 test_hold_creates_a_captain_row_when_beads_requires_due_without_custom_type
 test_archived_answered_hold_still_satisfies_the_gate
 test_archived_answer_in_a_user_configured_archive_satisfies_the_gate
+test_new_hold_posts_one_decision_message

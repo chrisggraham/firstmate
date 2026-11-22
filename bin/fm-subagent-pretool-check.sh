@@ -181,6 +181,18 @@ FM_ROOT=${FM_ROOT_OVERRIDE:-$(CDPATH='' cd -- "$SCRIPT_DIR/.." 2>/dev/null && pw
 FM_HOME=${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}
 STATE=${FM_STATE_OVERRIDE:-$FM_HOME/state}
 
+# Narrow captain-private opt-in: an empty config/allow-session-messaging file
+# releases exactly listagents and sendmessage, so the primary can message the
+# captain's other sessions. Content, a directory, or an unreadable file keeps
+# denying.
+SESSION_MESSAGING_TOOLS='listagents sendmessage'
+OPTIN_FILE=${FM_CONFIG_OVERRIDE:-$FM_HOME/config}/allow-session-messaging
+if [ -f "$OPTIN_FILE" ] && [ -r "$OPTIN_FILE" ] && ! grep -q '[^[:space:]]' "$OPTIN_FILE"; then
+  for allowed in $SESSION_MESSAGING_TOOLS; do
+    [ "$NORMALIZED" != "$allowed" ] || exit 0
+  done
+fi
+
 # Scope to a genuine primary home, exactly as the session-start nudge and the
 # turn-end guard do. fm_primary_scope_matches accepts a plain checkout or a
 # marked secondmate home - both operate a fleet and must dispatch through it -

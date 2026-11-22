@@ -61,6 +61,11 @@ Three exclusions keep the shape test from producing false positives.
   So it is not the "work, agent, schedule, or isolated workspace that firstmate would not know about" the guard exists to stop, and the stem match on `task` is a false positive rather than a policy.
   The cost of the false positive was concrete: the primary could not track its own plan, and the deny text told it to run `bin/fm-brief.sh` and `bin/fm-spawn.sh` to create a todo entry.
 
+A third, opt-in exception releases exactly `listagents` and `sendmessage`, so the primary can list and message the captain's other sessions.
+It applies only when the empty file `config/allow-session-messaging` exists in the home's config directory (`FM_CONFIG_OVERRIDE` when set).
+A file with any non-whitespace content, a directory, or an unreadable file keeps both tools denied.
+Absent the file, behavior is unchanged, and every other delegation tool stays denied.
+
 Both exclusion lists match the whole normalized name, never a substring, so neither can widen by accident: `TaskCreateAgent` and `RemoteTaskCreate` stay denied.
 Folding the two lists together would be the drift risk, because the observe-or-stop rationale is not true of a tool that writes.
 

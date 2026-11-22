@@ -55,7 +55,7 @@ The guard remains a backstop.
 
 ## Guard predicates
 
-The turn-end guard checks primary scope first, then supervision need, then watcher health.
+The turn-end guard checks primary scope first, then unanswered captain notes, then supervision need, then watcher health.
 The mid-turn pull warning in `bin/fm-guard.sh` judges watcher health differently, as described under [pull-warning verdict by supervision model](#pull-warning-verdict-by-supervision-model).
 
 ### Primary scope
@@ -70,6 +70,12 @@ The marker must meet both of these conditions:
 An unmarked checkout or invalid marker falls through to the git-dir check.
 That check keeps crewmate and scout linked worktrees inert because their git dir differs from their git common dir.
 It also requires `AGENTS.md`, `bin/`, and the effective state directory.
+
+### Unanswered captain notes
+
+An in-scope primary that acknowledged a captain inbox note without a reply is stopped once, with the note ids, so the turn publishes the reply before it ends.
+`bin/fm-inbox.sh unanswered` owns which notes count, and `state/.inbox-unanswered-flagged` records the notes already flagged, so each note stops at most one turn.
+The check runs whether or not any work is under way, because a chat client shows the conversation from the inbox records alone.
 
 ### Supervision need
 

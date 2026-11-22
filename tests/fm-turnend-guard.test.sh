@@ -313,6 +313,32 @@ test_hook_silent_when_no_work_in_flight() {
   pass "fm-turnend-guard: silent no-op with nothing in flight"
 }
 
+# A captain note acknowledged without a reply stops the turn once, even with
+# nothing in flight; a note that has a reply, or one already flagged, does not.
+test_hook_stops_once_per_unanswered_note() {
+  local dir out status
+  dir=$(make_primary_dir "$TMP_ROOT/hook-unanswered")
+  cp "$ROOT/bin/fm-inbox.sh" "$dir/bin/fm-inbox.sh"
+  mkdir -p "$dir/state/inbox/handled" "$dir/state/inbox/.replies"
+  printf 'seq=1\nid=1700000000-asked\n--\nWhat blocks it?\n' \
+    > "$dir/state/inbox/handled/1700000000-asked.note"
+  printf 'seq=2\nid=1700000000-answered\n--\nAnd this?\n' \
+    > "$dir/state/inbox/handled/1700000000-answered.note"
+  printf 'seq=3\nid=1700000000-answered\n--\nDone.\n' \
+    > "$dir/state/inbox/.replies/1700000000-answered"
+  out=$(run_hook "$dir" false); status=$?
+  expect_code 2 "$status" "an acknowledged note without a reply must stop the turn"
+  assert_contains "$out" "1700000000-asked" "the stop names the unanswered note"
+  assert_contains "$out" "fm-inbox.sh reply" "the stop says how to answer"
+  case "$out" in
+    *1700000000-answered*) fail "a note with a reply must not be named: $out" ;;
+  esac
+  out=$(run_hook "$dir" false); status=$?
+  expect_code 0 "$status" "the same note must stop only one turn"
+  [ -z "$out" ] || fail "a flagged note produced output again: $out"
+  pass "fm-turnend-guard: an unanswered captain note stops exactly one turn"
+}
+
 test_hook_blocks_when_fresh_beacon_has_no_live_lock() {
   local dir out status
   dir=$(make_primary_dir "$TMP_ROOT/hook-fresh-no-lock")
@@ -2758,3 +2784,4 @@ test_hook_away_daemon_allows_beacon_within_poll_derived_grace
 test_hook_away_daemon_blocks_dead_daemon_despite_poll_derived_grace
 test_hook_away_daemon_blocks_beacon_older_than_poll_derived_grace
 test_hook_no_afk_ignores_poll_derived_grace
+test_hook_stops_once_per_unanswered_note
