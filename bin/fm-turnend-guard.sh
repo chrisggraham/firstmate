@@ -223,6 +223,28 @@ budget_reset() {
   fm_lock_release "$BUDGET_LOCK"
 }
 
+# A captain note acknowledged without a reply leaves the captain's chat with no
+# answer. Stop the turn once per such note, so it publishes the reply first;
+# the flagged record bounds this to one stop per note.
+flag_unanswered_notes() {
+  local flagged="$STATE/.inbox-unanswered-flagged" ids id new='' msg
+  ids=$(FM_HOME=$FM_HOME FM_STATE_OVERRIDE=$STATE "$SCRIPT_DIR/fm-inbox.sh" unanswered 2>/dev/null) || return 0
+  for id in $ids; do
+    grep -qxF "$id" "$flagged" 2>/dev/null || new="$new $id"
+  done
+  [ -n "$new" ] || return 0
+  # shellcheck disable=SC2086 # One id per line.
+  printf '%s\n' $new >>"$flagged" 2>/dev/null || return 0
+  msg="Captain inbox note(s)$new were acknowledged without a reply. Answer each with bin/fm-inbox.sh reply <id> -- <text> before ending the turn."
+  if [ "$AGY_MODE" -eq 1 ]; then
+    jq -cn --arg r "$msg" '{decision:"continue",reason:$r}'
+    exit 0
+  fi
+  printf '%s\n' "$msg" >&2
+  exit 2
+}
+flag_unanswered_notes
+
 fm_supervision_status "$STATE" "$GRACE"
 if [ "$FM_SUP_NEEDED" = false ]; then
   [ -e "$FAILURE_NOTICE" ] || budget_reset

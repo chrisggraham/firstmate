@@ -58,6 +58,9 @@
 # `--until` records the captain's own deferral date through `tasks-axi hold
 # --until`, so a "revisit later" answer is stored as a date instead of a live
 # card.
+# A new hold (not a repeat of an active one) also posts its reason as a
+# decision message about `item:<task-id>` through `fm-inbox.sh post`; a failed
+# post warns on stderr and never fails the hold.
 #
 # `answer` records the captain's exact words and resolves the call in the same
 # act. It requires a non-empty captain decision file of at most 8192 bytes and
@@ -296,6 +299,15 @@ publish_parent_hold() {  # <task-id> <occurrence> <verb> <note> [until-date]
     0|1) PARENT_HOLD_PUBLISHED=1 ;;
     *) printf 'actionable: task %s is held for the captain in this home but that did not reach the parent channel (rc=%s)\n' "$id" "$rc" >&2 ;;
   esac
+}
+
+# Post a new hold to the captain's message stream as a decision, so a chat
+# client shows it as a card (bin/fm-inbox.sh owns the message contract). The
+# hold is already durable, so a failed post only warns.
+post_decision() {  # <task-id> <reason>
+  FM_HOME=$FM_HOME FM_STATE_OVERRIDE=$STATE "$SCRIPT_DIR/fm-inbox.sh" \
+    post --kind decision --re "item:$1" -- "$2" >/dev/null 2>&1 \
+    || printf 'fm-captain-hold: task %s is held, but its decision message was not posted\n' "$1" >&2
 }
 
 CAPTAIN_META_LOCK=
@@ -1225,6 +1237,7 @@ command_hold() {
     || fail "task $id lost its hold-set stamp while being held"
   occurrence=$(( $(resolution_record_count "$(show_field "$show" body)") + 1 ))
   publish_parent_hold "$id" "$occurrence" needs-decision "$reason" "$until"
+  [ "$preserve_hold_set" -eq 1 ] || post_decision "$id" "$reason"
   if [ -n "$origin" ]; then
     write_hold_origin "$id" "$(show_field "$show" body)" "$origin" || exit $?
   fi

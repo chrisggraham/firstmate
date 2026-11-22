@@ -504,6 +504,8 @@ home=$(make_home ready-free)
 ready=$(run_inbox "$home" ready) || fail "ready should succeed with no lock"
 assert_equals "fm-primary-ready.v1" "$(printf '%s' "$ready" | json_get schema)" \
   "ready uses the readiness schema"
+assert_equals "not-running" "$(printf '%s' "$ready" | json_get state)" \
+  "no lock holder is not running"
 assert_equals "free" "$(printf '%s' "$ready" | python3 -c 'import json,sys; print(json.load(sys.stdin)["lock"]["state"])')" \
   "no lock file is free, not live"
 assert_equals "False" "$(printf '%s' "$ready" | python3 -c 'import json,sys; print(json.load(sys.stdin)["can_receive"])')" \
@@ -602,6 +604,12 @@ assert_equals "healthy" "$(printf '%s' "$held" | json_get wake_consumer state)" 
   "lock-holder ancestry plus a fresh beacon is a healthy wake consumer"
 assert_equals "True" "$(printf '%s' "$held" | json_get can_receive)" \
   "a held lock with a healthy wake consumer can receive work"
+assert_equals "ready" "$(run_inbox "$home" ready --json | json_get state)" \
+  "a held lock with a healthy wake consumer is ready"
+printf 'away\n' > "$home/state/.afk"
+assert_equals "away" "$(run_inbox "$home" ready | json_get state)" \
+  "a held lock in away mode is away"
+rm -f "$home/state/.afk"
 kill_holder
 trap fm_test_cleanup EXIT
 pass "readiness says unknown (or not-receivable) instead of inferring liveness from a lock"
@@ -654,3 +662,73 @@ run_inbox "$home" drain --ack "$did" >/dev/null || fail "drain --ack failed"
 assert_absent "$home/state/inbox/$did.note" "acked note leaves pending"
 assert_present "$home/state/inbox/handled/$did.note" "acked note is in handled"
 pass "drain --ack still moves the note to handled"
+
+# --- chat client contract: reply --, kinds, actions, unanswered -------------
+
+home=$(make_home chat)
+asked=$(run_inbox "$home" note --json -- "What blocks item seven?") || fail "note failed"
+ask_id=$(printf '%s' "$asked" | json_get id)
+run_inbox "$home" reply "$ask_id" -- "-- not an option" >/dev/null \
+  || fail "reply should accept -- before the text"
+replies=$(run_inbox "$home" messages)
+assert_equals "-- not an option" "$(printf '%s' "$replies" | message_field 1 body)" \
+  "reply drops the first -- and keeps the text after it"
+pass "reply accepts -- before the text"
+
+posted=$(run_inbox "$home" post --json --kind decision --re item:web-7 -- "Merge it?") \
+  || fail "a decision post should succeed"
+assert_equals "decision" "$(printf '%s' "$posted" | json_get kind)" \
+  "post --json reports the kind"
+plain=$(run_inbox "$home" post --json -- "Merged.") || fail "a plain post should succeed"
+assert_equals "text" "$(printf '%s' "$plain" | json_get kind)" "the default kind is text"
+set +e
+bad_kind=$(run_inbox "$home" post --kind poll -- "x" 2>&1)
+bad_kind_code=$?
+set -e
+expect_code 1 "$bad_kind_code" "an unknown kind is refused"
+assert_contains "$bad_kind" "invalid kind" "the refusal names the kind"
+stream=$(run_inbox "$home" messages --json)
+assert_equals "text text decision text" "$(printf '%s' "$stream" | message_column kind)" \
+  "every message carries its kind"
+pass "post --kind marks decision messages in the stream"
+
+acted=$(printf '' | run_inbox "$home" note --json --re item:web-7 --action "done" -) \
+  || fail "an action note without text should succeed"
+act_id=$(printf '%s' "$acted" | json_get id)
+said=$(run_inbox "$home" note --json --re item:web-8 --action start-now -- "Before lunch.") \
+  || fail "an action note with text should succeed"
+stream=$(run_inbox "$home" messages)
+assert_equals "null null null null done start-now" "$(printf '%s' "$stream" | message_column action)" \
+  "only action notes carry an action"
+assert_equals "Action: done on item:web-7" "$(printf '%s' "$stream" | message_field 4 body)" \
+  "an action note without text names the action"
+assert_equals "Before lunch." "$(printf '%s' "$stream" | message_field 5 body)" \
+  "an action note keeps its text"
+assert_contains "$(grep "inbox:$act_id" "$home/state/.wake-queue")" "[action done re item:web-7]" \
+  "the wake summary names the action and the item"
+assert_contains "$(run_inbox "$home" list)" "$act_id  [action done re item:web-7]" \
+  "list shows the action and the item"
+set +e
+no_item=$(run_inbox "$home" note --re web-7 --action "done" 2>&1)
+no_item_code=$?
+bad_action=$(run_inbox "$home" note --re item:web-7 --action merge 2>&1)
+bad_action_code=$?
+set -e
+expect_code 1 "$no_item_code" "an action without an item reference is refused"
+assert_contains "$no_item" "--action needs --re item:<id>" "the refusal names the item reference"
+expect_code 1 "$bad_action_code" "an unknown action is refused"
+assert_contains "$bad_action" "invalid action" "the refusal names the action"
+pass "action notes reach Firstmate as ordinary notes that name the action"
+
+said_id=$(printf '%s' "$said" | json_get id)
+# shellcheck disable=SC2086 # deliberate word splitting: one id per --ack arg.
+run_inbox "$home" drain --ack $ask_id $act_id $said_id >/dev/null || fail "drain --ack failed"
+printf 'id=1600000000-legacy\nat=2020-01-01T00:00:00Z\nsource=text\n--\nold\n' \
+  > "$home/state/inbox/handled/1600000000-legacy.note"
+unanswered=$(run_inbox "$home" unanswered | sort | tr '\n' ' ')
+expected=$(printf '%s\n' "$act_id" "$said_id" | sort | tr '\n' ' ')
+assert_equals "$expected" "$unanswered" \
+  "unanswered lists acknowledged notes without a reply, not older unsequenced notes"
+run_inbox "$home" reply "$act_id" "Done." >/dev/null || fail "reply failed"
+assert_equals "$said_id" "$(run_inbox "$home" unanswered)" "a reply clears the note"
+pass "unanswered lists acknowledged notes that still need a reply"

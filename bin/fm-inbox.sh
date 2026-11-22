@@ -20,14 +20,15 @@
 #           fleet work and must not become fleet work.
 #
 # Usage:
-#   fm-inbox.sh note [--request-id <id>] [--re <ref>] [--json] [--] <text>...
-#   fm-inbox.sh note [--request-id <id>] [--re <ref>] [--json] -   (body from stdin)
+#   fm-inbox.sh note [--request-id <id>] [--re <ref>] [--action <name>] [--json] [--] <text>...
+#   fm-inbox.sh note [--request-id <id>] [--re <ref>] [--action <name>] [--json] -   (body from stdin)
 #   fm-inbox.sh announce [--json] <id>
-#   fm-inbox.sh reply [--json] <id> <text>... | reply [--json] <id> -
-#   fm-inbox.sh post [--re <ref>] [--json] [--] <text>... | post [--re <ref>] [--json] -
-#   fm-inbox.sh messages [--after <cursor>]
+#   fm-inbox.sh reply [--json] <id> [--] <text>... | reply [--json] <id> -
+#   fm-inbox.sh post [--re <ref>] [--kind text|decision] [--json] [--] <text>... | post ... -
+#   fm-inbox.sh messages [--after <cursor>] [--json]
 #   fm-inbox.sh receipts [--after <cursor>] [--all-pending] [--all-handled] [--all-replies]
-#   fm-inbox.sh ready
+#   fm-inbox.sh ready [--json]
+#   fm-inbox.sh unanswered
 #   fm-inbox.sh say  [<file.wav>]       (default: audio on stdin)
 #   fm-inbox.sh status
 #   fm-inbox.sh ask  <question>...
@@ -71,24 +72,37 @@
 # `--re <ref>` attaches an optional reference to a note or post: a Bearings item
 # (`item:<task-id>`) or another message id. A reply always references its note.
 # A reference is opaque here; nothing checks that it names an existing thing.
+# `note --action <name> --re item:<id>` asks Firstmate to act on that item: one
+# of done, defer, drop, stop, start-now. It is an ordinary note that Firstmate
+# handles under its own rules; the text is optional and defaults to naming the
+# action. `list`, `drain` and the wake summary show a note's action and reference.
+# `post --kind decision` marks a message that asks the captain to decide; the
+# default kind is text. bin/fm-captain-hold.sh posts one for every new hold.
+# `unanswered` lists acknowledged notes with no reply, one id per line, for the
+# turn-end guard. Notes saved before the sequence existed are not listed.
 # `messages` is the one ordered stream a chat client reads: notes and Firstmate
 # messages together, oldest first, after an optional cursor. JSON
 # `fm-inbox-messages.v1`:
 #   {"schema", "home", "generated", "messages": [...], "cursor", "omitted": [...]}
-#   message: {"id", "at", "from": "captain"|"firstmate", "body", "cursor",
-#             "re": <ref>|null, "state": "pending"|"handled"|null}
-# `state` is set only on captain notes and is current when read. A page after a
-# cursor does not repeat an older note whose state changed since; read
-# `receipts` or the stream without --after for that. `cursor` is the last message returned,
-# or the --after value when none are; pass it back as --after to read on.
+#   message: {"id", "at", "from": "captain"|"firstmate", "kind": "text"|"decision",
+#             "body", "cursor", "re": <ref>|null, "action": <name>|null,
+#             "state": "pending"|"handled"|null}
+# `action` and `state` are set only on captain notes; `state` is current when
+# read. A page after a cursor does not repeat an older note whose state changed
+# since; read `receipts` or the stream without --after for that. `cursor` is
+# the last message returned, or the --after value when none are; pass it back
+# as --after to read on.
 # A page holds at most MESSAGES_BOUND messages and omitted[] says when more wait.
 # Firstmate message ids start with `fm-`. A note saved before this home kept the
 # sequence has no sequence of its own: it is listed first, as history, with a
 # cursor that sorts before every sequenced one. `post --json` prints
-# `fm-inbox-post.v1`: {"schema", "outcome", "id", "re", "cursor", "path"}.
+# `fm-inbox-post.v1`: {"schema", "outcome", "id", "kind", "re", "cursor", "path"}.
 # `ready` is the read-only primary-readiness projection (lock, wake-consumer
-# health, away posture, observation time). It never acquires the session lock
-# and never infers liveness from a lock file, a session, or a pane.
+# health, away posture, observation time), always JSON `fm-primary-ready.v1`.
+# Its `state` sums that up for a chat client: `not-running` when no session holds
+# the lock or its wake consumer is down, `away` in away mode, else `ready`.
+# It never acquires the session lock and never infers liveness from a lock
+# file, a session, or a pane.
 #
 # Configuration. A region, a model id and an AWS profile name somebody's account
 # and somebody's choices, so this file carries no default for any of them. Each is
@@ -105,9 +119,9 @@
 # An absent profile means the call uses whatever credentials are already in the
 # environment, which is also what FM_INBOX_PROFILE= (empty) forces.
 #
-# `note`, `announce`, `reply`, `post`, `messages`, `receipts`, `ready`, `status`,
-# `list` and `drain` need NO configuration at all, because they make no model
-# call. The voice handover depends on `note`, so it keeps working in a home that
+# `note`, `announce`, `reply`, `post`, `messages`, `receipts`, `ready`, `unanswered`,
+# `status`, `list` and `drain` need NO configuration at all, because they make
+# no model call. The voice handover depends on `note`, so it keeps working in a home that
 # has configured nothing. `--json` / `messages` / `receipts` / `ready` require
 # python3, which a firstmate home already uses for other tools.
 #
@@ -115,8 +129,8 @@
 #   FM_HOME              operational home whose state/ and data/ are used.
 #
 # PRIVACY: `say` sends your audio and `ask` sends your question to Bedrock.
-# `note`, `announce`, `reply`, `post`, `messages`, `receipts`, `ready`, `status`,
-# `list` and `drain` make no network call at all.
+# `note`, `announce`, `reply`, `post`, `messages`, `receipts`, `ready`, `unanswered`,
+# `status`, `list` and `drain` make no network call at all.
 #
 # `note` is also the queueing half of the spoken interface: when the voice agent
 # in bin/fm-voice-relay.py hands real work over to firstmate, it runs this
@@ -316,6 +330,22 @@ note_summary_from_body() {
   printf '%s' "$1" | tr '\n\t' '  ' | cut -c1-100
 }
 
+# The note's action and reference as one line, for example
+# `action done re item:web-7`; empty for a note with neither.
+note_label() {  # <path>
+  local label
+  label=$(sed -n '/^--$/q;s/^action=/action /p;s/^re=/re /p' "$1" | tr '\n' ' ')
+  printf '%s' "${label% }"
+}
+
+# The wake and drain summary: the label first, so Firstmate sees what an app
+# action asks before the start of the body.
+note_summary() {  # <path>
+  local label
+  label=$(note_label "$1")
+  note_summary_from_body "${label:+[$label] }$(read_note_body "$1")"
+}
+
 write_note_file() {  # <path> <id> <source> <body> [extra] [request-id]
   local path=$1 id=$2 source=$3 body=$4 extra=${5:-} request_id=${6:-}
   {
@@ -482,7 +512,7 @@ queue_note() {
     if [ -f "$reserved" ]; then
       id=$(publish_from_reservation "$request_id" "$source" "$body" "$extra") \
         || die "request id $request_id is reserved but unreadable; retry the same request id"
-      summary=$(note_summary_from_body "$(read_note_body "$(note_path "$id")")")
+      summary=$(note_summary "$(note_path "$id")")
       finish_note_result replay "$id" "$request_id" "$json" "$strict" "$summary"
       return $?
     fi
@@ -494,12 +524,12 @@ queue_note() {
       rm -f "$tmp"
       id=$(publish_from_reservation "$request_id" "$source" "$body" "$extra") \
         || die "request id $request_id is reserved but unreadable; retry the same request id"
-      summary=$(note_summary_from_body "$(read_note_body "$(note_path "$id")")")
+      summary=$(note_summary "$(note_path "$id")")
       finish_note_result replay "$id" "$request_id" "$json" "$strict" "$summary"
       return $?
     fi
     save_note "$tmp" "$id"
-    summary=$(note_summary_from_body "$body")
+    summary=$(note_summary "$INBOX/$id.note")
     finish_note_result created "$id" "$request_id" "$json" "$strict" "$summary"
     return $?
   fi
@@ -509,14 +539,15 @@ queue_note() {
   id="$(date +%s)-${staging_name#.staging-}"
   write_note_file "$tmp" "$id" "$source" "$body" "$extra" ""
   save_note "$tmp" "$id"
-  summary=$(note_summary_from_body "$body")
+  summary=$(note_summary "$INBOX/$id.note")
   finish_note_result created "$id" "" "$json" "$strict" "$summary"
 }
 
-NOTE_USAGE="usage: fm-inbox.sh note [--request-id <id>] [--re <ref>] [--json] [--] <text>... (or: note -)"
+NOTE_USAGE="usage: fm-inbox.sh note [--request-id <id>] [--re <ref>] [--action <name> --re item:<id>] [--json] [--] <text>... (or: note -)"
+NOTE_ACTIONS="done defer drop stop start-now"
 
 cmd_note() {
-  local body json=0 request_id="" re=""
+  local body="" json=0 request_id="" re="" action="" extra
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --json) json=1; shift ;;
@@ -533,13 +564,22 @@ cmd_note() {
         valid_reference "$re" || die "invalid reference (use 1-128 characters: A-Za-z0-9._:-)"
         shift 2
         ;;
+      --action)
+        [ "$#" -ge 2 ] || die "$NOTE_USAGE"
+        action=$2
+        case " $NOTE_ACTIONS " in
+          *" $action "*) ;;
+          *) die "invalid action (use one of: $NOTE_ACTIONS)" ;;
+        esac
+        shift 2
+        ;;
       --) shift; break ;;
       -h|--help) die "$NOTE_USAGE" ;;
       *) break ;;
     esac
   done
   if [ "$#" -eq 0 ]; then
-    die "$NOTE_USAGE"
+    [ -n "$action" ] || die "$NOTE_USAGE"
   elif [ "$1" = "-" ]; then
     [ "$#" -eq 1 ] || die "$NOTE_USAGE"
     body=$(cat; printf .)
@@ -547,7 +587,17 @@ cmd_note() {
   else
     body="$*"
   fi
-  queue_note text "$body" "${re:+re=$re}" "$request_id" "$json"
+  extra=${re:+re=$re}
+  if [ -n "$action" ]; then
+    case "$re" in
+      item:?*) ;;
+      *) die "--action needs --re item:<id>" ;;
+    esac
+    # The text is optional for an action; without it the body names the action.
+    [ -n "${body//[[:space:]]/}" ] || body="Action: $action on $re"
+    extra="action=$action"$'\n'"$extra"
+  fi
+  queue_note text "$body" "$extra" "$request_id" "$json"
 }
 
 cmd_announce() {
@@ -560,7 +610,7 @@ cmd_announce() {
   [ -n "$id" ] || die "usage: fm-inbox.sh announce [--json] <id>"
   valid_note_id "$id" || die "invalid note id"
   path=$(note_path "$id") || die "no such note: $id"
-  summary=$(note_summary_from_body "$(read_note_body "$path")")
+  summary=$(note_summary "$path")
   state=$(note_announce_state "$id" "$path")
   if [ "$state" != true ] && [ "$path" = "$INBOX/handled/$id.note" ]; then
     state=acknowledged
@@ -700,6 +750,8 @@ stage_reply() {  # <note-id> <body>
   DEST="$REPLIES/$1"
 }
 
+REPLY_USAGE="usage: fm-inbox.sh reply [--json] <id> [--] <text>... (or: reply [--json] <id> -)"
+
 cmd_reply() {
   local json=0 id body path
   if [ "${1:-}" = "--json" ]; then
@@ -707,14 +759,15 @@ cmd_reply() {
     shift
   fi
   id=${1:-}
-  [ -n "$id" ] || die "usage: fm-inbox.sh reply [--json] <id> <text>... (or: reply [--json] <id> -)"
+  [ -n "$id" ] || die "$REPLY_USAGE"
   shift
   valid_note_id "$id" || die "invalid note id"
   path=$(note_path "$id") || die "no such note: $id"
+  [ "${1:-}" != "--" ] || shift
   if [ "$#" -eq 0 ]; then
-    die "usage: fm-inbox.sh reply [--json] <id> <text>... (or: reply [--json] <id> -)"
+    die "$REPLY_USAGE"
   elif [ "$1" = "-" ]; then
-    [ "$#" -eq 1 ] || die "usage: fm-inbox.sh reply [--json] <id> -"
+    [ "$#" -eq 1 ] || die "$REPLY_USAGE"
     body=$(cat; printf .)
     body=${body%.}
   else
@@ -749,13 +802,22 @@ PY
   fi
 }
 
-POST_USAGE="usage: fm-inbox.sh post [--re <ref>] [--json] [--] <text>... (or: post [--re <ref>] [--json] -)"
+POST_USAGE="usage: fm-inbox.sh post [--re <ref>] [--kind text|decision] [--json] [--] <text>... (or: ... -)"
 
 cmd_post() {
-  local json=0 re="" body seq
+  local json=0 re="" kind=text body seq extra
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --json) json=1; shift ;;
+      --kind)
+        [ "$#" -ge 2 ] || die "$POST_USAGE"
+        kind=$2
+        case "$kind" in
+          text|decision) ;;
+          *) die "invalid kind (use text or decision)" ;;
+        esac
+        shift 2
+        ;;
       --re)
         [ "$#" -ge 2 ] || die "$POST_USAGE"
         re=$2
@@ -779,10 +841,12 @@ cmd_post() {
   [ -n "${body//[[:space:]]/}" ] || die "refusing to post an empty message"
   [ "$json" -eq 0 ] || need_python
   load_wake_lib || die "the message sequence needs $FM_ROOT/bin/fm-wake-lib.sh"
-  stage_outbox_message "$body" "${re:+re=$re}"
+  extra="kind=$kind"
+  [ -z "$re" ] || extra+=$'\n'"re=$re"
+  stage_outbox_message "$body" "$extra"
   seq=$(publish_outbox_message) || die "could not claim the message sequence"
   if [ "$json" -eq 1 ]; then
-    emit_post_json "$MESSAGE_ID" "$re" "$seq"
+    emit_post_json "$MESSAGE_ID" "$re" "$seq" "$kind"
   else
     printf 'posted %s\n' "$MESSAGE_ID"
   fi
@@ -801,14 +865,15 @@ publish_outbox_message() {
   printf '%s\n' "$seq"
 }
 
-emit_post_json() {  # <id> <re> <seq>
-  python3 - "$1" "$2" "$3" "$OUTBOX/$1" <<'PY'
+emit_post_json() {  # <id> <re> <seq> <kind>
+  python3 - "$1" "$2" "$3" "$OUTBOX/$1" "$4" <<'PY'
 import json, sys
-message_id, re, seq, path = sys.argv[1:5]
+message_id, re, seq, path, kind = sys.argv[1:6]
 json.dump({
     "schema": "fm-inbox-post.v1",
     "outcome": "created",
     "id": message_id,
+    "kind": kind,
     "re": re or None,
     "cursor": "%012d" % int(seq),
     "path": path,
@@ -882,14 +947,17 @@ def sequence_cursor(meta):
         return "%012d" % int(raw)
     return None
 
+# A reply has no kind header and is plain text; only captain notes carry an action.
 def message(message_id, meta, body, sender, cursor, re, state):
     return {
         "id": message_id,
         "at": meta.get("at"),
         "from": sender,
+        "kind": meta.get("kind") or "text",
         "body": body,
         "cursor": cursor,
         "re": re or None,
+        "action": meta.get("action") if sender == "captain" else None,
         "state": state,
     }
 
@@ -1147,7 +1215,9 @@ PY
 }
 
 cmd_ready() {
-  [ "$#" -eq 0 ] || die "usage: fm-inbox.sh ready"
+  # The output is always JSON; --json is accepted for symmetry with the others.
+  [ "${1:-}" != "--json" ] || shift
+  [ "$#" -eq 0 ] || die "usage: fm-inbox.sh ready [--json]"
   need_python
   # shellcheck source=bin/fm-session-lock-lib.sh
   . "$SELF_DIR/fm-session-lock-lib.sh"
@@ -1245,10 +1315,21 @@ recv = True if can_receive == "true" else False if can_receive == "false" else "
 pid_val = int(lock_pid) if lock_pid.isdigit() else None
 age_val = int(beacon_age) if beacon_age.isdigit() else None
 home_label = "/".join(Path(home).parts[-2:]) if home else home
+# One word for a chat client: no session holding the lock, or a session whose
+# wake consumer is down, reads no notes. Quiet mode keeps the captain present.
+if lock_state != "held":
+    state = "not-running"
+elif posture == "away":
+    state = "away"
+elif consumer_state == "down":
+    state = "not-running"
+else:
+    state = "ready"
 json.dump({
     "schema": "fm-primary-ready.v1",
     "home": home_label,
     "observed_at": observed,
+    "state": state,
     "lock": {
         "state": lock_state,
         "pid": pid_val,
@@ -1406,11 +1487,12 @@ PY
 
 cmd_list() {
   [ -d "$INBOX" ] || { printf '(inbox empty)\n'; return 0; }
-  local any=0
+  local any=0 label
   for f in "$INBOX"/*.note; do
     [ -e "$f" ] || break
     any=1
-    printf '%s\n' "$(basename "$f" .note)"
+    label=$(note_label "$f")
+    printf '%s%s\n' "$(basename "$f" .note)" "${label:+  [$label]}"
     sed -n '/^--$/,$p' "$f" | tail -n +2 | sed 's/^/    /'
   done
   [ "$any" -eq 1 ] || printf '(inbox empty)\n'
@@ -1436,6 +1518,20 @@ cmd_drain() {
   printf '\nAck with: fm-inbox.sh drain --ack <id>...\n'
 }
 
+# Acknowledged notes that have no reply, one id per line. Only notes with a
+# sequence count: an older note predates replies to every note.
+cmd_unanswered() {
+  [ -d "$INBOX/handled" ] || return 0
+  local f id
+  for f in "$INBOX"/handled/*.note; do
+    [ -e "$f" ] || break
+    id=$(basename "$f" .note)
+    [ ! -e "$REPLIES/$id" ] || continue
+    [ -n "$(sed -n '/^--$/q;/^seq=[0-9][0-9]*$/p' "$f")" ] || continue
+    printf '%s\n' "$id"
+  done
+}
+
 # ---------------------------------------------------------------- dispatch
 
 case "${1:-}" in
@@ -1450,6 +1546,7 @@ case "${1:-}" in
   status)   shift; cmd_status ;;
   ask)      shift; cmd_ask "$@" ;;
   list)     shift; cmd_list ;;
+  unanswered) shift; cmd_unanswered ;;
   drain)    shift; cmd_drain "$@" ;;
   ''|-h|--help|help)
     # The whole header block, found rather than counted: everything after the
