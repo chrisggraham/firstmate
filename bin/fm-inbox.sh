@@ -77,7 +77,9 @@
 #   {"schema", "home", "generated", "messages": [...], "cursor", "omitted": [...]}
 #   message: {"id", "at", "from": "captain"|"firstmate", "body", "cursor",
 #             "re": <ref>|null, "state": "pending"|"handled"|null}
-# `state` is set only on captain notes. `cursor` is the last message returned,
+# `state` is set only on captain notes and is current when read. A page after a
+# cursor does not repeat an older note whose state changed since; read
+# `receipts` or the stream without --after for that. `cursor` is the last message returned,
 # or the --after value when none are; pass it back as --after to read on.
 # A page holds at most MESSAGES_BOUND messages and omitted[] says when more wait.
 # Firstmate message ids start with `fm-`. A note saved before this home kept the
@@ -779,7 +781,11 @@ cmd_post() {
   load_wake_lib || die "the message sequence needs $FM_ROOT/bin/fm-wake-lib.sh"
   stage_outbox_message "$body" "${re:+re=$re}"
   seq=$(publish_outbox_message) || die "could not claim the message sequence"
-  emit_post_result "$MESSAGE_ID" "$re" "$seq" "$json"
+  if [ "$json" -eq 1 ]; then
+    emit_post_json "$MESSAGE_ID" "$re" "$seq"
+  else
+    printf 'posted %s\n' "$MESSAGE_ID"
+  fi
 }
 
 # Publish the staged outbox message under the sequence lock. Prints the sequence.
@@ -795,11 +801,7 @@ publish_outbox_message() {
   printf '%s\n' "$seq"
 }
 
-emit_post_result() {  # <id> <re> <seq> <json>
-  if [ "$4" -eq 0 ]; then
-    printf 'posted %s\n' "$1"
-    return 0
-  fi
+emit_post_json() {  # <id> <re> <seq>
   python3 - "$1" "$2" "$3" "$OUTBOX/$1" <<'PY'
 import json, sys
 message_id, re, seq, path = sys.argv[1:5]
