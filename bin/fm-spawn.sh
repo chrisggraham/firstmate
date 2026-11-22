@@ -2923,8 +2923,11 @@ launch_template() {
   # Claude's system-prompt carrier while preserving the normal distrust of
   # project and fetched content. A persistent secondmate receives its own
   # supervisor contract instead, so this task-worker statement does not apply.
+  # --strict-mcp-config with no --mcp-config loads no MCP servers: plugin and
+  # user MCP servers would otherwise start in every worker session and cost
+  # memory, while workers reach their tools through the axi CLIs.
   claude)
-    printf '%s' 'CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false CLAUDE_CODE_SEND_FEEDBACK=0 claude __CLAUDEPERMFLAG__ __CLAUDEADDDIRS__--settings __CLAUDESETTINGS__ '
+    printf '%s' 'CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false CLAUDE_CODE_SEND_FEEDBACK=0 claude __CLAUDEPERMFLAG__ __CLAUDEADDDIRS__--strict-mcp-config --settings __CLAUDESETTINGS__ '
     if [ "$kind" != secondmate ]; then
       printf '%s' '__CLAUDEEXCLUDE__'
       printf '%s' "--append-system-prompt '$(spawn_claude_task_channel_statement)' "
